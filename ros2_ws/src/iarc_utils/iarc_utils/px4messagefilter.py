@@ -61,6 +61,15 @@ class PX4MessageFilter:
         while ref_buffer:
             ref_msg = ref_buffer[0]  # Get the oldest message from the reference buffer
             ref_t = self._extract_timestamp(ref_msg)
+
+            latest_time = max(
+                self._extract_timestamp(buf[-1])
+                for buf in self.buffers.values() if buf
+            )
+            # wait for future messages if the latest message is withing the tolerance, otherwise we can discard this reference message and try the next one
+            if latest_time - ref_t < self.tolerance_us:
+                return
+
             matched_msgs = {reference_topic: ref_msg}
             all_matched = True
             for topic in self.topics[1:]: # Check other topics
