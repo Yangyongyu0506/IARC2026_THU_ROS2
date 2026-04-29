@@ -1,7 +1,0 @@
-# This service is for getting the static rotation matrix and the translation vector between the PX4 NED frame and the ROS2 ENU arena frame.
----
-float64[9] rotation_matrix # The rotation matrix R from the PX4 NED frame to the ROS2 ENU arena frame, represented as a 1D array in row-major order.
-
-float64[3] translation_vector # The translation vector t from the PX4 NED frame to the ROS2 ENU arena frame, represented as a 1D array.
-
-float64 mean_error_sq # The mean squared error of the transformation, calculated as the average of the squared distances between the transformed points and their corresponding points in the target frame.

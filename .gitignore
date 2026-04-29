@@ -53,3 +53,4 @@ CATKIN_IGNORE
 
 # User specific files
 **/.vscode/
+**/test_pkg/
