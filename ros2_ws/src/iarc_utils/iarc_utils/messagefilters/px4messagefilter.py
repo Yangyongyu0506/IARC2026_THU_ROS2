@@ -1,3 +1,5 @@
+# PX4MessageFilter
+
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from collections import deque
@@ -27,7 +29,7 @@ class PX4MessageFilter:
         self.subscriptions = []
 
         # Create subscriptions for each topic
-        for topic, msg_type, qosprofile in zip(topics, types, qosprofiles):
+        for id, (topic, msg_type, qosprofile) in enumerate(zip(topics, types, qosprofiles)):
             self.subscriptions.append(
                 node.create_subscription(
                     msg_type,
