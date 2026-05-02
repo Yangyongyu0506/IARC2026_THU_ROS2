@@ -55,3 +55,5 @@ CATKIN_IGNORE
 **/.vscode/
 **/test_pkg/
 **/other_materials/
+**/AGENTS.md
+**/.ruff_cache/
