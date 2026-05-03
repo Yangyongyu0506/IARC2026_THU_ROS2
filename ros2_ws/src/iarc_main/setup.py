@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+from glob import glob
+import os
 
 package_name = 'iarc_main'
 
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (f"share/{package_name}/config", glob("config/*")),
+        (f"share/{package_name}/launch", glob("launch/*.launch.py")), 
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,6 +28,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'frametransformer_node = iarc_main.frametransformer_node:main',
         ],
     },
 )

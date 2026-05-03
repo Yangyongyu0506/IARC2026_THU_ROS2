@@ -7,10 +7,16 @@
   <maintainer email="yang-yy24@mails.tsinghua.edu.cn">yangy</maintainer>
   <license>Apache-2.0</license>
 
+  <depend>rclpy</depend>
   <depend>px4_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
   <depend>iarc_msgs</depend>
-  <depend>rclpy</depend>
+  <depend>iarc_utils</depend>
+  <depend>python3-pymap3d</depend>
+  <depend>tf2_ros</depend>
+  <depend>ament_index_python</depend>
+  <depend>rcl_interfaces</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
