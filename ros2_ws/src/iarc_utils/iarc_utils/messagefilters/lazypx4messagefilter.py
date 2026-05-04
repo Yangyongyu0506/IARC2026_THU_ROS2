@@ -1,4 +1,9 @@
-# LazyPX4MessageFilter
+"""LazyPX4MessageFilter: Synchronize messages by timestamp, reacting only to reference-topic arrivals.
+
+Compared to PX4MessageFilter, this version only tries to synchronize when a new message
+arrives on the reference (first) topic.  This avoids redundant checks when high-frequency
+non-reference topics update frequently.
+"""
 
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
@@ -6,8 +11,26 @@ from collections import deque
 from typing import Callable, List, Dict, Any
 from functools import partial
 
+
 class LazyPX4MessageFilter:
-    def __init__(self, node: Node, tolerance_us: int, topics: List[str], types: List[Any], qosprofiles: List[QoSProfile], buffer_depths: List[int], callback: Callable):
+    """
+    Lazy multi-topic timestamp synchronizer.
+
+    Synchronization is triggered only by the reference topic (index 0).  Non-reference
+    messages are silently buffered.  Otherwise the matching algorithm is identical
+    to PX4MessageFilter.
+    """
+
+    def __init__(
+        self,
+        node: Node,
+        tolerance_us: int,
+        topics: List[str],
+        types: List[Any],
+        qosprofiles: List[QoSProfile],
+        buffer_depths: List[int],
+        callback: Callable,
+    ):
         """
         Initialize the LazyPX4MessageFilter.
 
@@ -19,23 +42,36 @@ class LazyPX4MessageFilter:
         :param buffer_depths: List of buffer depths for each topic.
         :param callback: Function to call with synchronized messages.
         """
-        assert len(topics) == len(types), "Topics and types lists must be of the same length."
-        assert len(topics) == len(qosprofiles), "Topics and QoS profiles lists must be of the same length."
-        assert len(topics) == len(buffer_depths), "Topics and buffer depths lists must be of the same length."
+        assert len(topics) == len(types), (
+            "Topics and types lists must be of the same length."
+        )
+        assert len(topics) == len(qosprofiles), (
+            "Topics and QoS profiles lists must be of the same length."
+        )
+        assert len(topics) == len(buffer_depths), (
+            "Topics and buffer depths lists must be of the same length."
+        )
         self.tolerance_us = tolerance_us
         self.topics = topics
         self.callback = callback
-        self.buffers: Dict[str, deque] = {topic: deque(maxlen=buffer_depth) for topic, buffer_depth in zip(topics, buffer_depths)}
+        self.buffers: Dict[str, deque] = {
+            topic: deque(maxlen=buffer_depth)
+            for topic, buffer_depth in zip(topics, buffer_depths)
+        }
         self.subscriptions = []
 
         # Create subscriptions for each topic
-        for id, (topic, msg_type, qosprofile) in enumerate(zip(topics, types, qosprofiles)):
+        for id, (topic, msg_type, qosprofile) in enumerate(
+            zip(topics, types, qosprofiles)
+        ):
             self.subscriptions.append(
                 node.create_subscription(
                     msg_type,
                     topic,
-                    partial(self._ref_message_callback, topic=topic) if id == 0 else partial(self._ord_message_callback, topic=topic),
-                    qosprofile
+                    partial(self._ref_message_callback, topic=topic)
+                    if id == 0
+                    else partial(self._ord_message_callback, topic=topic),
+                    qosprofile,
                 )
             )
 
@@ -69,14 +105,13 @@ class LazyPX4MessageFilter:
         ref_buffer = self.buffers[reference_topic]
         if not ref_buffer:
             return  # No messages in the reference buffer
-        
+
         while ref_buffer:
             ref_msg = ref_buffer[0]  # Get the oldest message from the reference buffer
             ref_t = self._extract_timestamp(ref_msg)
 
             latest_time = max(
-                self._extract_timestamp(buf[-1])
-                for buf in self.buffers.values() if buf
+                self._extract_timestamp(buf[-1]) for buf in self.buffers.values() if buf
             )
             # wait for future messages if the latest message is withing the tolerance, otherwise we can discard this reference message and try the next one
             if latest_time - ref_t < self.tolerance_us:
@@ -84,7 +119,7 @@ class LazyPX4MessageFilter:
 
             matched_msgs = {reference_topic: ref_msg}
             all_matched = True
-            for topic in self.topics[1:]: # Check other topics
+            for topic in self.topics[1:]:  # Check other topics
                 buffer = self.buffers[topic]
                 if not buffer:
                     all_matched = False
@@ -106,9 +141,8 @@ class LazyPX4MessageFilter:
                     break  # This message is outside the tolerance, cannot synchronize
             if all_matched:
                 self.callback(*matched_msgs.values())
-                for buffer in self.buffers.values():
-                    buffer.popleft()  # Remove the used messages from the buffers
-                continue # Immediately try next synchronization
+                ref_buffer.popleft()
+                continue  # Immediately try next synchronization
             break  # Only attempt to synchronize with the oldest reference message
 
     def _extract_timestamp(self, msg: Any) -> int:
@@ -118,9 +152,17 @@ class LazyPX4MessageFilter:
         :param msg: The message to extract the timestamp from.
         :return: The timestamp as an integer.
         """
-        if hasattr(msg, 'timestamp'):  # For px4_msgs. Attention that this is in microseconds
+        if hasattr(
+            msg, "timestamp"
+        ):  # For px4_msgs. Attention that this is in microseconds
             return msg.timestamp
-        elif hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):  # For ROS 2 built-in types
-            return int(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec) // 1000  # Convert to microseconds
+        elif hasattr(msg, "header") and hasattr(
+            msg.header, "stamp"
+        ):  # For ROS 2 built-in types
+            return (
+                int(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec) // 1000
+            )  # Convert to microseconds
         else:
-            raise ValueError("Message does not have a recognizable timestamp attribute.")
+            raise ValueError(
+                "Message does not have a recognizable timestamp attribute."
+            )

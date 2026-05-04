@@ -1,6 +1,8 @@
-# PX4MessageFilter
-"""
-This module filters synchronized messages of multiple topics based on their timestamps.
+"""PX4MessageFilter: Synchronize messages from multiple topics by closest-in-time matching.
+
+The first topic in the constructor list is treated as the reference (expected to be the
+least frequent). Each incoming message triggers a synchronization attempt across all
+non-empty buffers; matched sets are discarded from the front of each deque on success.
 """
 
 from rclpy.node import Node
@@ -9,8 +11,26 @@ from collections import deque
 from typing import Callable, List, Dict, Any
 from functools import partial
 
+
 class PX4MessageFilter:
-    def __init__(self, node: Node, tolerance_us: int, topics: List[str], types: List[Any], qosprofiles: List[QoSProfile], buffer_depths: List[int], callback: Callable):
+    """
+    Eager multi-topic timestamp synchronizer.
+
+    Every message arrival triggers a synchronization pass.  The reference topic is the
+    first element of ``topics``; it should be the sparse/slow topic so that matching
+    is meaningful.
+    """
+
+    def __init__(
+        self,
+        node: Node,
+        tolerance_us: int,
+        topics: List[str],
+        types: List[Any],
+        qosprofiles: List[QoSProfile],
+        buffer_depths: List[int],
+        callback: Callable,
+    ):
         """
         Initialize the PX4MessageFilter.
 
@@ -22,23 +42,34 @@ class PX4MessageFilter:
         :param buffer_depths: List of buffer depths for each topic.
         :param callback: Function to call with synchronized messages.
         """
-        assert len(topics) == len(types), "Topics and types lists must be of the same length."
-        assert len(topics) == len(qosprofiles), "Topics and QoS profiles lists must be of the same length."
-        assert len(topics) == len(buffer_depths), "Topics and buffer depths lists must be of the same length."
+        assert len(topics) == len(types), (
+            "Topics and types lists must be of the same length."
+        )
+        assert len(topics) == len(qosprofiles), (
+            "Topics and QoS profiles lists must be of the same length."
+        )
+        assert len(topics) == len(buffer_depths), (
+            "Topics and buffer depths lists must be of the same length."
+        )
         self.tolerance_us = tolerance_us
         self.topics = topics
         self.callback = callback
-        self.buffers: Dict[str, deque] = {topic: deque(maxlen=buffer_depth) for topic, buffer_depth in zip(topics, buffer_depths)}
+        self.buffers: Dict[str, deque] = {
+            topic: deque(maxlen=buffer_depth)
+            for topic, buffer_depth in zip(topics, buffer_depths)
+        }
         self.subscriptions = []
 
         # Create subscriptions for each topic
-        for id, (topic, msg_type, qosprofile) in enumerate(zip(topics, types, qosprofiles)):
+        for id, (topic, msg_type, qosprofile) in enumerate(
+            zip(topics, types, qosprofiles)
+        ):
             self.subscriptions.append(
                 node.create_subscription(
                     msg_type,
                     topic,
                     partial(self._message_callback, topic=topic),
-                    qosprofile
+                    qosprofile,
                 )
             )
 
@@ -62,14 +93,13 @@ class PX4MessageFilter:
         ref_buffer = self.buffers[reference_topic]
         if not ref_buffer:
             return  # No messages in the reference buffer
-        
+
         while ref_buffer:
             ref_msg = ref_buffer[0]  # Get the oldest message from the reference buffer
             ref_t = self._extract_timestamp(ref_msg)
 
             latest_time = max(
-                self._extract_timestamp(buf[-1])
-                for buf in self.buffers.values() if buf
+                self._extract_timestamp(buf[-1]) for buf in self.buffers.values() if buf
             )
             # wait for future messages if the latest message is withing the tolerance, otherwise we can discard this reference message and try the next one
             if latest_time - ref_t < self.tolerance_us:
@@ -77,7 +107,7 @@ class PX4MessageFilter:
 
             matched_msgs = {reference_topic: ref_msg}
             all_matched = True
-            for topic in self.topics[1:]: # Check other topics
+            for topic in self.topics[1:]:  # Check other topics
                 buffer = self.buffers[topic]
                 if not buffer:
                     all_matched = False
@@ -99,9 +129,8 @@ class PX4MessageFilter:
                     break  # This message is outside the tolerance, cannot synchronize
             if all_matched:
                 self.callback(*matched_msgs.values())
-                for buffer in self.buffers.values():
-                    buffer.popleft()  # Remove the used messages from the buffers
-                continue # Immediately try next synchronization
+                ref_buffer.popleft()
+                continue  # Immediately try next synchronization
             break  # Only attempt to synchronize with the oldest reference message
 
     def _extract_timestamp(self, msg: Any) -> int:
@@ -111,9 +140,17 @@ class PX4MessageFilter:
         :param msg: The message to extract the timestamp from.
         :return: The timestamp as an integer.
         """
-        if hasattr(msg, 'timestamp'):  # For px4_msgs. Attention that this is in microseconds
+        if hasattr(
+            msg, "timestamp"
+        ):  # For px4_msgs. Attention that this is in microseconds
             return msg.timestamp
-        elif hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):  # For ROS 2 built-in types
-            return int(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec) // 1000  # Convert to microseconds
+        elif hasattr(msg, "header") and hasattr(
+            msg.header, "stamp"
+        ):  # For ROS 2 built-in types
+            return (
+                int(msg.header.stamp.sec * 1e9 + msg.header.stamp.nanosec) // 1000
+            )  # Convert to microseconds
         else:
-            raise ValueError("Message does not have a recognizable timestamp attribute.")
+            raise ValueError(
+                "Message does not have a recognizable timestamp attribute."
+            )
