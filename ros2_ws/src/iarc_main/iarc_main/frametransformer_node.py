@@ -6,10 +6,11 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.executors import ExternalShutdownException
 from rcl_interfaces.msg import ParameterDescriptor
 from ament_index_python.packages import get_package_share_directory
-from iarc_utils.mathematics import rotation_matrix_to_quaternion, get_normal_vector
+from iarc_utils.mathematics import rotation_matrix_to_quaternion, get_normal_vector, get_xyz_from_points
+from iarc_utils.messagefilters import PX4MessageFilter
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
-from px4_msgs.msg import VehicleLocalPosition 
+from px4_msgs.msg import VehicleLocalPosition, VehicleGlobalPosition
 import numpy as np
 import pymap3d as pm
 import json
@@ -59,8 +60,42 @@ class FrameTransformerNode(Node):
                 description="Frame ID for the PX4 NED frame."
             )
         ).value
-        self.is_origin_valid = False
-        self.origin_wgs84 = np.zeros(3)  # [lat, lon, alt_amsl]
+        self.strategy = self.declare_parameter(
+            "strategy", "no_manual_calib", ParameterDescriptor(
+                description="Algorithm for calculating the transform from the arena frame to the PX4 NED frame. Options are: 1. no_manual_calib: directly use the local position data from PX4 to decide the transform. 2. manual_calib: subscribe to several paired global and local position data and calculate the transform using SVD."
+            )
+        ).value
+        assert self.strategy in ["no_manual_calib", "manual_calib"], "Invalid strategy parameter. Must be either 'no_manual_calib' or 'manual_calib'."
+        match self.strategy:
+            case "no_manual_calib":
+                self.get_logger().info("Using no_manual_calib strategy for transform calculation.")
+                self.is_origin_valid = False
+                self.origin_wgs84 = np.zeros(3)  # [lat, lon, alt_amsl]
+            case "manual_calib":
+                self.get_logger().info("Using manual_calib strategy for transform calculation.")
+                self.global_position_topic = self.declare_parameter(
+                    "global_position_topic", "", ParameterDescriptor(
+                        description="Topic name for global position data. Its message type is px4_msgs/msg/VehicleGlobalPosition."
+                    )
+                ).value
+                self.msgfilterslop = self.declare_parameter(
+                    "msgfilterslop", 10, ParameterDescriptor(
+                        description="The time tolerance in microseconds for matching the local and global position messages."
+                    )
+                ).value
+                self.queue_size = self.declare_parameter(
+                    "queue_size", 10, ParameterDescriptor(
+                        description="The queue size for storing the local and global position messages for matching."
+                    )
+                ).value
+                self.least_paired_msgs_num = self.declare_parameter(
+                    "least_paired_msgs_num", 10, ParameterDescriptor(
+                        description="The least number of paired local and global position messages required for calculating the transform."
+                    )
+                ).value
+                self.paired_points = {"px4": [], "arena": []}
+                self.is_calibrated = False
+
     
     def _ros2_init(self):
         """
@@ -68,6 +103,8 @@ class FrameTransformerNode(Node):
         """
         # Load arena config
         self._load_arena_config()
+        # Init static transform broadcaster
+        self.tf_broadcaster = StaticTransformBroadcaster(self)
         # Init PX4 qosprofile
         px4_qosprofile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -75,14 +112,36 @@ class FrameTransformerNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        self.create_subscription(
-            VehicleLocalPosition,
-            self.local_position_topic,
-            self._local_position_callback,
-            px4_qosprofile
-        )
-        # Init static transform broadcaster
-        self.tf_broadcaster = StaticTransformBroadcaster(self)
+        if self.strategy == "no_manual_calib":
+            self.create_subscription(
+                VehicleLocalPosition,
+                self.local_position_topic,
+                self._local_position_callback,
+                px4_qosprofile
+            )
+            self.get_logger().info(f"Subscribed to {self.local_position_topic} for local position data from PX4")
+        elif self.strategy == "manual_calib":
+            self.arena_corners_ned_temp = np.array(
+                [
+                    pm.ned.geodetic2ned(
+                        self.arena_corners_wgs84[i][0], 
+                        self.arena_corners_wgs84[i][1], 
+                        self.arena_corners_wgs84[i][2],
+                        self.arena_corners_wgs84[0][0], 
+                        self.arena_corners_wgs84[0][1], 
+                        self.arena_corners_wgs84[0][2]) for i in range(len(self.arena_corners_wgs84))
+                ]
+            )
+            self.R_temp = np.column_stack(get_xyz_from_points(self.arena_corners_ned_temp))
+            self.px4msgfilter = PX4MessageFilter(
+                self,
+                self.msgfilterslop,
+                [self.local_position_topic, self.global_position_topic],
+                [VehicleLocalPosition, VehicleGlobalPosition],
+                [px4_qosprofile, px4_qosprofile],
+                [self.queue_size, self.queue_size],
+                self._filter_callback
+            )
 
     def _load_arena_config(self):
         """
@@ -106,7 +165,7 @@ class FrameTransformerNode(Node):
         if not self.is_origin_valid:
             # Origin not initialized, parse the origin from the first received message
             if msg.xy_global and msg.z_global: # Check if the ref pos from autopilot is valid
-                self.origin_wgs84 = np.array([msg.ref_lat, msg.ref_lon, msg.ref_alt])
+                self.origin_wgs84 = [msg.ref_lat, msg.ref_lon, msg.ref_alt] # The ref_alt is in AMSL
                 self.heading_yaw = msg.heading
                 self.tf_stamp_us = msg.ref_timestamp
                 self._publish_static_transform() # Publish the static transform immediately after receiving the first valid local position message to minimize the waiting time for other nodes that depend on the transform
@@ -130,17 +189,7 @@ class FrameTransformerNode(Node):
                     self.origin_wgs84[2]) for i in range(len(self.arena_corners_wgs84))
             ]
         )
-
-        arena_x_vec0 = arena_corners_ned[1] - arena_corners_ned[0]
-        arena_y_vec0 = arena_corners_ned[3] - arena_corners_ned[0]
-        arena_z_vec0 = np.cross(arena_x_vec0, arena_y_vec0)
-        arena_z_vec = get_normal_vector(arena_corners_ned)
-        arena_z_vec *= np.sign(np.dot(arena_z_vec, arena_z_vec0)) # Ensure the direction of the normal vector is consistent with the right-hand rule defined by the order of the corners in the config file
-        arena_y_vec = np.cross(arena_z_vec, arena_x_vec0)
-        arena_y_vec /= np.linalg.norm(arena_y_vec)
-        arena_x_vec = np.cross(arena_y_vec, arena_z_vec)
-        arena_x_vec /= np.linalg.norm(arena_x_vec)
-        R_arena2ned = np.column_stack((arena_x_vec, arena_y_vec, arena_z_vec))
+        R_arena2ned = np.column_stack(get_xyz_from_points(arena_corners_ned))
         # unify the rotation matrix
         R_arena2ned[:, 2] *= np.sign(np.linalg.det(R_arena2ned))
         Q_arena2ned = rotation_matrix_to_quaternion(R_arena2ned)
@@ -159,6 +208,64 @@ class FrameTransformerNode(Node):
         tf.transform.rotation.w = Q_arena2ned[3]
         self.tf_broadcaster.sendTransform(tf)
         self.get_logger().info(f"Published static transform from {self.arena_frame_id} to {self.px4_ned_frame_id} with translation {t_arena2ned} and rotation (quaternion) {Q_arena2ned}")
+
+    def _filter_callback(self, local_msg: VehicleLocalPosition, global_msg: VehicleGlobalPosition):
+        """
+        """
+        if not self.is_calibrated:
+            if len(self.paired_points["px4"]) < self.least_paired_msgs_num or len(self.paired_points["arena"]) < self.least_paired_msgs_num:
+                self.get_logger().info(
+                    f"Received paired local and global position messages."
+                )
+                self.paired_points["px4"].append([local_msg.x, local_msg.y, local_msg.z])
+                arena_point_temp = np.array(pm.ned.geodetic2ned(
+                    global_msg.lat, 
+                    global_msg.lon, 
+                    global_msg.alt,
+                    self.arena_corners_wgs84[0][0], 
+                    self.arena_corners_wgs84[0][1], 
+                    self.arena_corners_wgs84[0][2]
+                ))
+                arena_point = self.R_temp.T @ arena_point_temp.T
+                self.paired_points["arena"].append([arena_point[0], arena_point[1], arena_point[2]])
+            else:
+                assert len(self.paired_points["px4"]) == len(self.paired_points["arena"]), "The number of paired points in px4 and arena should be the same."
+                # perform SVD to calculate the rotation and translation
+                px4_points = np.array(self.paired_points["px4"])
+                arena_points = np.array(self.paired_points["arena"])
+                centroid_px4 = np.mean(px4_points, axis=0)
+                centroid_arena = np.mean(arena_points, axis=0)
+                H = (px4_points - centroid_px4).T @ (arena_points - centroid_arena)
+                U, S, Vt = np.linalg.svd(H)
+                R = Vt.T @ U.T
+                if np.linalg.det(R) < 0:
+                    Vt[-1, :] *= -1
+                    R = Vt.T @ U.T
+                t = centroid_arena - R @ centroid_px4
+                # publish the static transform
+                Q = rotation_matrix_to_quaternion(R)
+                tf = TransformStamped()
+                tf.header.stamp = self.get_clock().now().to_msg()
+                tf.header.frame_id = self.arena_frame_id
+                tf.child_frame_id = self.px4_ned_frame_id
+                tf.transform.translation.x = t[0]
+                tf.transform.translation.y = t[1]
+                tf.transform.translation.z = t[2]
+                tf.transform.rotation.x = Q[0]
+                tf.transform.rotation.y = Q[1]
+                tf.transform.rotation.z = Q[2]
+                tf.transform.rotation.w = Q[3]
+                self.tf_broadcaster.sendTransform(tf)
+                self.get_logger().info(f"Published static transform from {self.arena_frame_id} to {self.px4_ned_frame_id} with translation {t} and rotation (quaternion) {Q}")
+                self.is_calibrated = True
+
+
+    def on_exit(self):
+        """
+        Clean up resources on node shutdown if necessary
+        """
+        self.get_logger().warn("Shutting down FrameTransformerNode")
+        pass
     
 def main(args=None):
     rclpy.init(args=args)
@@ -166,8 +273,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
-        # Placeholder for any cleanup operations if needed in the future
-        pass
+        node.on_exit()
     finally:
         if rclpy.ok():
             node.destroy_node()

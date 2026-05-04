@@ -85,3 +85,20 @@ def get_normal_vector(points) -> np.ndarray:
     _, _, vh = np.linalg.svd(centered_points)
     normal_vector = vh[-1]
     return normal_vector / np.linalg.norm(normal_vector)
+
+def get_xyz_from_points(points) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate the x, y and z coordinate vectors based on predefined points.
+    """
+    assert points.shape[0] >= 3, "At least 3 points are required to define the coordinate system."
+    x0 = points[1] - points[0]
+    y0 = points[-1] - points[0]
+    x0 /= np.linalg.norm(x0)
+    z = get_normal_vector(points)
+    z *= np.sign(z * np.cross(x0, y0))
+    z /= np.linalg.norm(z)
+    y = np.cross(z, x0)
+    y /= np.linalg.norm(y)
+    x = np.cross(y, z)
+    x /= np.linalg.norm(x)
+    return x, y, z
