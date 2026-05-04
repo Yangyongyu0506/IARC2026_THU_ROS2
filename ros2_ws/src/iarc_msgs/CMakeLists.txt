@@ -15,7 +15,8 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetStaticTransform.srv"
-  DEPENDENCIES std_msgs  
+  "msg/Stamp.msg"
+  DEPENDENCIES std_msgs geometry_msgs nav_msgs sensor_msgs 
 )
 
 if(BUILD_TESTING)

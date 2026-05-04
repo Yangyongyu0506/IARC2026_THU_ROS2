@@ -12,7 +12,9 @@ from px4_msgs.msg import VehicleOdometry
 from tf2_ros import TransformBroadcaster
 import numpy as np
 from collections import deque
-from iarc_utils.mathematics import lerp
+from iarc_utils.mathematics import lerp, slerp, stamp2us
+from iarc_utils.messagefilters import PX4MessageClamper
+from iarc_msgs.msg import Stamp
 
 class OdomTFBroadcasterNode(Node):
     def __init__(self):
@@ -56,7 +58,13 @@ class OdomTFBroadcasterNode(Node):
                 50.0,
                 ParameterDescriptor(description="The rate (in Hz) at which to publish the transform when using strategies other than 'odom_callback'."),
             ).value
-            self.msg_and_stamp_queue = deque(maxlen=2)  # For storing the latest two odometry messages for interpolation or EKF
+            self.msg_and_stamp_queue = deque(maxlen=1)  # For storing the latest odometry message for interpolation or EKF
+            if self.strategy.lower() == "lerp":
+                self.stamp_topic = self.declare_parameter(
+                    "stamp_topic",
+                    "stamp",
+                    ParameterDescriptor(description="The topic name for the Stamp messages used for triggering interpolation when using the 'lerp' strategy."),
+                ).value
 
     def _ros2_init(self):
         """
@@ -65,8 +73,7 @@ class OdomTFBroadcasterNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.fcn_dict = {
             "zero_order_hold": self._broadcast_zero_order_hold,
-            "lerp": self._broadcast_lerp,
-            "odom_callback": self._broadcast_odom_callback,
+            "lerp": self._lerp_timer_callback,
             "ekf": self._broadcast_ekf,
         }
         px4_qosprofile = QoSProfile(
@@ -89,26 +96,36 @@ class OdomTFBroadcasterNode(Node):
                 self._odom_callback,
                 px4_qosprofile,
             )
+            if self.strategy.lower() == "lerp":
+                self.px4messageclamper = PX4MessageClamper(
+                    self,
+                    topics=[self.stamp_topic, self.px4_odom_topic],
+                    types=[Stamp, VehicleOdometry],
+                    qosprofiles=[px4_qosprofile, px4_qosprofile],
+                    bufferdepths=[10, 10],
+                    callback=self._lerp_clamped_callback
+                )
+                self.stamp_pub = self.create_publisher(Stamp, self.stamp_topic, px4_qosprofile)
             self.timer = self.create_timer(1. / self.publish_rate, self.fcn_dict[self.strategy.lower()])
 
     def _odom_callback(self, msg: VehicleOdometry):
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED or msg.velocity_frame != VehicleOdometry.VELOCITY_FRAME_NED:
             self.get_logger().warn(f"received odometry message with unsupported pose_frame {msg.pose_frame} or velocity_frame {msg.velocity_frame}. expected ned frames. ignoring this message.")
             return
-        self.msg_and_stamp_queue.append((msg, self.get_clock().now()))
+        self.msg_and_stamp_queue.append((msg, stamp2us(self.get_clock().now())))
 
     def _broadcast_odom_callback(self, msg: VehicleOdometry):
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED or msg.velocity_frame != VehicleOdometry.VELOCITY_FRAME_NED:
             self.get_logger().warn(f"received odometry message with unsupported pose_frame {msg.pose_frame} or velocity_frame {msg.velocity_frame}. expected ned frames. ignoring this message.")
             return
         t = TransformStamped()
-        t.header.stamp.sec = msg.timestamp_sample // 1000000
-        t.header.stamp.nanosec = (msg.timestamp_sample % 1000000) * 1000
+        t.header.stamp.sec = msg.timestamp_sample // 1000_000
+        t.header.stamp.nanosec = (msg.timestamp_sample % 1000_000) * 1000
         t.header.frame_id = self.px4_ned_frame_id
         t.child_frame_id = self.base_link_frame_id
-        t.transform.translation.x = msg.x
-        t.transform.translation.y = msg.y
-        t.transform.translation.z = msg.z
+        t.transform.translation.x = msg.position[0]
+        t.transform.translation.y = msg.position[1]
+        t.transform.translation.z = msg.position[2]
         # Note that PX4 quaternions are of the Hamilton convention (w, x, y, z), while ROS uses (x, y, z, w).
         t.transform.rotation.x = msg.q[1]
         t.transform.rotation.y = msg.q[2]
@@ -120,53 +137,50 @@ class OdomTFBroadcasterNode(Node):
         if not self.msg_and_stamp_queue:
             return
         time_now = self.get_clock().now()
-        msg, stamp = self.msg_and_stamp_queue[-1]
-        time_offset_us = msg.timestamp_sample - (stamp.sec * 1000000 + stamp.nanosec // 1000)
+        msg, stamp_us = self.msg_and_stamp_queue[-1]
+        time_offset_us = msg.timestamp_sample - stamp_us
         t = TransformStamped()
-        t.header.stamp.nanosec = (time_now.nanosec + (time_offset_us % 1000000) * 1000) % (10**9)
-        t.header.stamp.sec = time_now.sec + time_offset_us // 1000000 + (time_now.nanosec + (time_offset_us % 1000000) * 1000) // (10**9)
+        t.header.stamp.nanosec = (time_now.nanosec + (time_offset_us % 1000_000) * 1000) % (10**9)
+        t.header.stamp.sec = time_now.sec + time_offset_us // 1000_000 + (time_now.nanosec + (time_offset_us % 1000_000) * 1000) // (10**9)
         t.header.frame_id = self.px4_ned_frame_id
         t.child_frame_id = self.base_link_frame_id
-        t.transform.translation.x = msg.x
-        t.transform.translation.y = msg.y
-        t.transform.translation.z = msg.z
+        t.transform.translation.x = msg.position[0]
+        t.transform.translation.y = msg.position[1]
+        t.transform.translation.z = msg.position[2]
         t.transform.rotation.x = msg.q[1]
         t.transform.rotation.y = msg.q[2]
         t.transform.rotation.z = msg.q[3]
         t.transform.rotation.w = msg.q[0]
         self.tf_broadcaster.sendTransform(t)
 
-    def _broadcast_lerp(self):
-        if len(self.msg_and_stamp_queue) < 2:
+    def _lerp_timer_callback(self):
+        if not self.msg_and_stamp_queue:
             return
-        time_now = self.get_clock().now()
-        (msg1, stamp1), (msg2, stamp2) = self.msg_and_stamp_queue[0], self.msg_and_stamp_queue[1]
-        if stamp1 == stamp2:
-            self.get_logger().warn("Two odometry messages have the same timestamp. Cannot perform extrapolation. Ignoring this cycle.")
-            return
-        time_offset_us = msg2.timestamp_sample - (stamp2.sec * 1000000 + stamp2.nanosec // 1000)
+        msg = Stamp()
+        msg.timestamp_sample = stamp2us(self.get_clock().now()) + self.msg_and_stamp_queue[-1][0].timestamp_sample - self.msg_and_stamp_queue[-1][1]
+        self.stamp_pub.publish(msg)
+
+    def _lerp_clamped_callback(self, stamp_msg: Stamp, odom_msgs: tuple[VehicleOdometry, VehicleOdometry]):
+        """
+        Placeholder
+        """
+        odom_msg1, odom_msg2 = odom_msgs
         t = TransformStamped()
-        t.header.stamp.nanosec = (time_now.nanosec + (time_offset_us % 1000000) * 1000) % (10**9)
-        t.header.stamp.sec = time_now.sec + time_offset_us // 1000000 + (time_now.nanosec + (time_offset_us % 1000000) * 1000) // (10**9)
         t.header.frame_id = self.px4_ned_frame_id
         t.child_frame_id = self.base_link_frame_id
-        # Linear interpolation for translation
-        t.transform.translation.x = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.x, stamp2.sec + stamp2.nanosec / 1e9, msg2.x, time_now.sec + time_now.nanosec / 1e9)
-        t.transform.translation.y = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.y, stamp2.sec + stamp2.nanosec / 1e9, msg2.y, time_now.sec + time_now.nanosec / 1e9)
-        t.transform.translation.z = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.z, stamp2.sec + stamp2.nanosec / 1e9, msg2.z, time_now.sec + time_now.nanosec / 1e9)
+        t.header.stamp.nanosec = stamp_msg.timestamp_sample * 1000 % (10**9)
+        t.header.stamp.sec = (stamp_msg.timestamp_sample) // 1000_000 + (stamp_msg.timestamp_sample * 1000) // (10**9)
+        # Linear extrapolation for translation
+        pos_lerp = lerp(odom_msg1.timestamp_sample, np.array(odom_msg1.position), odom_msg2.timestamp_sample, np.array(odom_msg2.position), stamp_msg.timestamp_sample)
+        t.transform.translation.x = pos_lerp[0]
+        t.transform.translation.y = pos_lerp[1]
+        t.transform.translation.z = pos_lerp[2]
         # Spherical linear interpolation (slerp) for rotation
-        # Note: For simplicity, we will perform linear extrapolation on the quaternion components, which is not the same as slerp but can be sufficient for small time differences. For a more accurate implementation, consider using a proper slerp function.
-        x = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.q[1], stamp2.sec + stamp2.nanosec / 1e9, msg2.q[1], time_now.sec + time_now.nanosec / 1e9)
-        y = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.q[2], stamp2.sec + stamp2.nanosec / 1e9, msg2.q[2], time_now.sec + time_now.nanosec / 1e9)
-        z = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.q[3], stamp2.sec + stamp2.nanosec / 1e9, msg2.q[3], time_now.sec + time_now.nanosec / 1e9)
-        w = lerp(stamp1.sec + stamp1.nanosec / 1e9, msg1.q[0], stamp2.sec + stamp2.nanosec / 1e9, msg2.q[0], time_now.sec + time_now.nanosec / 1e9)
-        q = np.array([x, y, z, w])
-        q_norm = np.linalg.norm(q)
-        q /= q_norm  # Normalize the quaternion to ensure it's a valid rotation
-        t.transform.rotation.x = q[0]
-        t.transform.rotation.y = q[1]
-        t.transform.rotation.z = q[2]
-        t.transform.rotation.w = q[3]
+        q = slerp(odom_msg1.timestamp_sample, odom_msg1.q, odom_msg2.timestamp_sample, odom_msg2.q, stamp_msg.timestamp_sample)
+        t.transform.rotation.x = q[1]
+        t.transform.rotation.y = q[2]
+        t.transform.rotation.z = q[3]
+        t.transform.rotation.w = q[0]
         self.tf_broadcaster.sendTransform(t)
 
     def _broadcast_ekf(self):
@@ -184,5 +198,6 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         node.on_exit()
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()

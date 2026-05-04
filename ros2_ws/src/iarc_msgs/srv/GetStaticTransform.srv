@@ -1,6 +1,6 @@
 # This service is for getting the static rotation matrix and the translation vector between the PX4 NED frame and the ROS2 ENU arena frame.
 ---
-Quaternion orientation # The orientation of the transformation, represented as a quaternion (x, y, z, w).
+geometry_msgs/Quaternion orientation # The orientation of the transformation, represented as a quaternion (x, y, z, w).
 
 float64[3] translation_vector # The translation vector t from the PX4 NED frame to the ROS2 ENU arena frame, represented as a 1D array.
 
