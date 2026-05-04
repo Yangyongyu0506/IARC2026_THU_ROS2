@@ -29,6 +29,7 @@ setup(
     entry_points={
         'console_scripts': [
             'frametransformer_node = iarc_main.frametransformer_node:main',
+            'odomtfbroadcaster_node = iarc_main.odomtfbroadcaster_node:main',
         ],
     },
 )

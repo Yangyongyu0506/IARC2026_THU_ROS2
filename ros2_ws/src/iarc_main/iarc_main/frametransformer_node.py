@@ -1,4 +1,5 @@
-"""FrameTransformerNode: compute and broadcast the static transform between the arena frame and PX4 NED frame.
+"""
+FrameTransformerNode: compute and broadcast the static transform between the arena frame and PX4 NED frame.
 
 Two strategies are supported:
   - no_manual_calib: use the first valid local-position message to derive the transform
@@ -39,7 +40,6 @@ class FrameTransformerNode(Node):
         """
         Initialize parameters for the node.
         """
-        # ROS2 parameters' declaration
         self.local_position_topic = self.declare_parameter(
             "local_position_topic",
             "",
@@ -70,7 +70,7 @@ class FrameTransformerNode(Node):
         ).value
         self.arena_frame_id = self.declare_parameter(
             "arena_frame_id",
-            "arena",
+            "odom",
             ParameterDescriptor(description="Frame ID for the arena frame."),
         ).value
         self.px4_ned_frame_id = self.declare_parameter(
@@ -85,7 +85,7 @@ class FrameTransformerNode(Node):
                 description="Algorithm for calculating the transform from the arena frame to the PX4 NED frame. Options are: 1. no_manual_calib: directly use the local position data from PX4 to decide the transform. 2. manual_calib: subscribe to several paired global and local position data and calculate the transform using SVD."
             ),
         ).value
-        assert self.strategy in ["no_manual_calib", "manual_calib"], (
+        assert self.strategy.lower() in ["no_manual_calib", "manual_calib"], (
             "Invalid strategy parameter. Must be either 'no_manual_calib' or 'manual_calib'."
         )
         match self.strategy:
@@ -146,7 +146,7 @@ class FrameTransformerNode(Node):
             depth=1,
         )
         if self.strategy == "no_manual_calib":
-            self.create_subscription(
+            self.localpos_sub = self.create_subscription(
                 VehicleLocalPosition,
                 self.local_position_topic,
                 self._local_position_callback,

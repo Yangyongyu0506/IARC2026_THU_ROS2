@@ -145,9 +145,9 @@ class PX4MessageClamper:
         :return: The timestamp as an integer.
         """
         if hasattr(
-            msg, "timestamp"
+            msg, "timestamp_sample"
         ):  # For px4_msgs. Attention that this is in microseconds
-            return msg.timestamp
+            return msg.timestamp_sample
         elif hasattr(msg, "header") and hasattr(
             msg.header, "stamp"
         ):  # For ROS 2 built-in types
