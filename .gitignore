@@ -57,3 +57,4 @@ CATKIN_IGNORE
 **/other_materials/
 **/AGENTS.md
 **/.ruff_cache/
+**/*.bak

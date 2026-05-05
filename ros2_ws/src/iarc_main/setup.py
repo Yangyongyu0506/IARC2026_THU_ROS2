@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'frametransformer_node = iarc_main.frametransformer_node:main',
             'odomtfbroadcaster_node = iarc_main.odomtfbroadcaster_node:main',
+            'targetfeedback_node = iarc_main.targetfeedback_node:main',
         ],
     },
 )

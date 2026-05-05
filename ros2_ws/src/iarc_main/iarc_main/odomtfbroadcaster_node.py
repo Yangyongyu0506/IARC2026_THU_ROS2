@@ -13,8 +13,6 @@ from tf2_ros import TransformBroadcaster
 import numpy as np
 from collections import deque
 from iarc_utils.mathematics import lerp, slerp, stamp2us
-from iarc_utils.messagefilters import PX4MessageClamper
-from iarc_msgs.msg import Stamp
 
 class OdomTFBroadcasterNode(Node):
     def __init__(self):
@@ -47,7 +45,7 @@ class OdomTFBroadcasterNode(Node):
         self.strategy = self.declare_parameter(
             "strategy",
             "odom_callback",
-            ParameterDescriptor(description="The strategy for broadcasting the transform. Options are: 1. zero_order_hold: broadcast the transform with the latest received odometry data at a fixed rate. 2. lerp: linearly extrapolate the transform based on the latest two received odometry messages and broadcast at a fixed rate. 3. odom_callback: broadcast the transform only when a new odometry message is received, using the data from that message. 4. ekf: use an extended Kalman filter to estimate the transform based on the received odometry messages and broadcast at a fixed rate."),
+            ParameterDescriptor(description="The strategy for broadcasting the transform. Options are: 1. zero_order_hold: broadcast the transform with the latest received odometry data at a fixed rate. 2. lerp: linearly interpolate the transform based on the latest two received odometry messages and broadcast at a fixed rate. 3. odom_callback: broadcast the transform only when a new odometry message is received, using the data from that message. 4. ekf: use an extended Kalman filter to estimate the transform based on the received odometry messages and broadcast at a fixed rate."),
         ).value
         assert self.strategy.lower() in ["zero_order_hold", "lerp", "odom_callback", "ekf"], (
             "Invalid strategy parameter. Must be one of 'zero_order_hold', 'lerp', 'odom_callback', or 'ekf'."
@@ -58,22 +56,19 @@ class OdomTFBroadcasterNode(Node):
                 50.0,
                 ParameterDescriptor(description="The rate (in Hz) at which to publish the transform when using strategies other than 'odom_callback'."),
             ).value
-            self.msg_and_stamp_queue = deque(maxlen=1)  # For storing the latest odometry message for interpolation or EKF
-            if self.strategy.lower() == "lerp":
-                self.stamp_topic = self.declare_parameter(
-                    "stamp_topic",
-                    "stamp",
-                    ParameterDescriptor(description="The topic name for the Stamp messages used for triggering interpolation when using the 'lerp' strategy."),
-                ).value
+
+            self.msg_queue = deque(maxlen=2)  # For storing the latest 2 odometry messages.
+            self.t_query_us = -1
 
     def _ros2_init(self):
         """
         Placeholder
         """
         self.tf_broadcaster = TransformBroadcaster(self)
-        self.fcn_dict = {
+        self.odom_callback_dict = {
+            "odom_callback": self._broadcast_odom_callback,
             "zero_order_hold": self._broadcast_zero_order_hold,
-            "lerp": self._lerp_timer_callback,
+            "lerp": self._broadcast_lerp,
             "ekf": self._broadcast_ekf,
         }
         px4_qosprofile = QoSProfile(
@@ -82,45 +77,25 @@ class OdomTFBroadcasterNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        if self.strategy.lower() == "odom_callback":
-            self.odom_sub = self.create_subscription(
-                VehicleOdometry,
-                self.px4_odom_topic,
-                self._broadcast_odom_callback,
-                px4_qosprofile,
-            )
-        else:
-            self.odom_sub = self.create_subscription(
-                VehicleOdometry,
-                self.px4_odom_topic,
-                self._odom_callback,
-                px4_qosprofile,
-            )
-            if self.strategy.lower() == "lerp":
-                self.px4messageclamper = PX4MessageClamper(
-                    self,
-                    topics=[self.stamp_topic, self.px4_odom_topic],
-                    types=[Stamp, VehicleOdometry],
-                    qosprofiles=[px4_qosprofile, px4_qosprofile],
-                    bufferdepths=[10, 10],
-                    callback=self._lerp_clamped_callback
-                )
-                self.stamp_pub = self.create_publisher(Stamp, self.stamp_topic, px4_qosprofile)
-            self.timer = self.create_timer(1. / self.publish_rate, self.fcn_dict[self.strategy.lower()])
+        self.odom_sub = self.create_subscription(
+            VehicleOdometry,
+            self.px4_odom_topic,
+            self.odom_callback_dict[self.strategy.lower()],
+            px4_qosprofile,
+        )
 
     def _odom_callback(self, msg: VehicleOdometry):
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED or msg.velocity_frame != VehicleOdometry.VELOCITY_FRAME_NED:
             self.get_logger().warn(f"received odometry message with unsupported pose_frame {msg.pose_frame} or velocity_frame {msg.velocity_frame}. expected ned frames. ignoring this message.")
             return
-        self.msg_and_stamp_queue.append((msg, stamp2us(self.get_clock().now())))
+        self.msg_queue.append((msg, stamp2us(self.get_clock().now())))
 
-    def _broadcast_odom_callback(self, msg: VehicleOdometry):
-        if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED or msg.velocity_frame != VehicleOdometry.VELOCITY_FRAME_NED:
-            self.get_logger().warn(f"received odometry message with unsupported pose_frame {msg.pose_frame} or velocity_frame {msg.velocity_frame}. expected ned frames. ignoring this message.")
-            return
+    def _odom2tf(self, msg: VehicleOdometry, stamp: int) -> TransformStamped:
         t = TransformStamped()
-        t.header.stamp.sec = msg.timestamp_sample // 1000_000
-        t.header.stamp.nanosec = (msg.timestamp_sample % 1000_000) * 1000
+        if stamp < 0:
+            stamp = msg.timestamp_sample
+        t.header.stamp.sec = stamp // 1000_000
+        t.header.stamp.nanosec = (stamp % 1000_000) * 1000
         t.header.frame_id = self.px4_ned_frame_id
         t.child_frame_id = self.base_link_frame_id
         t.transform.translation.x = msg.position[0]
@@ -131,60 +106,68 @@ class OdomTFBroadcasterNode(Node):
         t.transform.rotation.y = msg.q[2]
         t.transform.rotation.z = msg.q[3]
         t.transform.rotation.w = msg.q[0]
-        self.tf_broadcaster.sendTransform(t)
+        return t
 
-    def _broadcast_zero_order_hold(self):
-        if not self.msg_and_stamp_queue:
-            return
-        time_now = self.get_clock().now()
-        msg, stamp_us = self.msg_and_stamp_queue[-1]
-        time_offset_us = msg.timestamp_sample - stamp_us
-        t = TransformStamped()
-        t.header.stamp.nanosec = (time_now.nanosec + (time_offset_us % 1000_000) * 1000) % (10**9)
-        t.header.stamp.sec = time_now.sec + time_offset_us // 1000_000 + (time_now.nanosec + (time_offset_us % 1000_000) * 1000) // (10**9)
-        t.header.frame_id = self.px4_ned_frame_id
-        t.child_frame_id = self.base_link_frame_id
-        t.transform.translation.x = msg.position[0]
-        t.transform.translation.y = msg.position[1]
-        t.transform.translation.z = msg.position[2]
-        t.transform.rotation.x = msg.q[1]
-        t.transform.rotation.y = msg.q[2]
-        t.transform.rotation.z = msg.q[3]
-        t.transform.rotation.w = msg.q[0]
-        self.tf_broadcaster.sendTransform(t)
-
-    def _lerp_timer_callback(self):
-        if not self.msg_and_stamp_queue:
-            return
-        msg = Stamp()
-        msg.timestamp_sample = stamp2us(self.get_clock().now()) + self.msg_and_stamp_queue[-1][0].timestamp_sample - self.msg_and_stamp_queue[-1][1]
-        self.stamp_pub.publish(msg)
-
-    def _lerp_clamped_callback(self, stamp_msg: Stamp, odom_msgs: tuple[VehicleOdometry, VehicleOdometry]):
+    def _broadcast_odom_callback(self, msg: VehicleOdometry):
         """
-        Placeholder
+        Broadcasts transform on every received odometry message using the data from that message.
         """
-        odom_msg1, odom_msg2 = odom_msgs
-        t = TransformStamped()
-        t.header.frame_id = self.px4_ned_frame_id
-        t.child_frame_id = self.base_link_frame_id
-        t.header.stamp.nanosec = stamp_msg.timestamp_sample * 1000 % (10**9)
-        t.header.stamp.sec = (stamp_msg.timestamp_sample) // 1000_000 + (stamp_msg.timestamp_sample * 1000) // (10**9)
-        # Linear extrapolation for translation
-        pos_lerp = lerp(odom_msg1.timestamp_sample, np.array(odom_msg1.position), odom_msg2.timestamp_sample, np.array(odom_msg2.position), stamp_msg.timestamp_sample)
-        t.transform.translation.x = pos_lerp[0]
-        t.transform.translation.y = pos_lerp[1]
-        t.transform.translation.z = pos_lerp[2]
-        # Spherical linear interpolation (slerp) for rotation
-        q = slerp(odom_msg1.timestamp_sample, odom_msg1.q, odom_msg2.timestamp_sample, odom_msg2.q, stamp_msg.timestamp_sample)
-        t.transform.rotation.x = q[1]
-        t.transform.rotation.y = q[2]
-        t.transform.rotation.z = q[3]
-        t.transform.rotation.w = q[0]
+        # if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED or msg.velocity_frame != VehicleOdometry.VELOCITY_FRAME_NED:
+        #     self.get_logger().warn(f"received odometry message with unsupported pose_frame {msg.pose_frame} or velocity_frame {msg.velocity_frame}. expected ned frames. ignoring this message.")
+        #     return
+        if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED:
+            self.get_logger().warn(f"received odometry message with unsupported pose_frame {msg.pose_frame}. expected ned frame. ignoring this message.")
+            return
+        t = self._odom2tf(msg, -1) 
         self.tf_broadcaster.sendTransform(t)
 
-    def _broadcast_ekf(self):
-        # Placeholder for EKF-based broadcasting implementation
+    def _broadcast_zero_order_hold(self, msg: VehicleOdometry):
+        """
+        Broadcasts transform at a fixed rate with zero-order hold strategy.
+        """
+        if self.t_query_us < 0: # Invalid query timestamp
+            self.t_query_us = msg.timestamp_sample # initialize query timestamp with the timestamp of the first received message
+        self.msg_queue.append(msg)
+        if len(self.msg_queue) == 2:
+            while rclpy.ok() and self.t_query_us <= self.msg_queue[-1].timestamp_sample:
+                t = self._odom2tf(self.msg_queue[0], self.t_query_us)
+                self.tf_broadcaster.sendTransform(t)
+                self.t_query_us += int(1e6 / self.publish_rate)
+
+    def _broadcast_lerp(self, msg: VehicleOdometry):
+        """
+        Broadcasts transform at a fixed rate with linear interpolation strategy.
+        """
+        if self.t_query_us < 0: # Invalid query timestamp
+            self.t_query_us = msg.timestamp_sample # initialize query timestamp with the timestamp of the first received message
+        self.msg_queue.append(msg)
+        if len(self.msg_queue) == 2:
+            while rclpy.ok() and self.t_query_us <= self.msg_queue[-1].timestamp_sample:
+                t0 = self._odom2tf(self.msg_queue[0], -1)
+                t1 = self._odom2tf(self.msg_queue[1], -1)
+                ratio = (self.t_query_us - self.msg_queue[0].timestamp_sample) / (self.msg_queue[1].timestamp_sample - self.msg_queue[0].timestamp_sample)
+                t_interp = TransformStamped()
+                t_interp.header.stamp.sec = self.t_query_us // 1000_000
+                t_interp.header.stamp.nanosec = (self.t_query_us % 1000_000) * 1000
+                t_interp.header.frame_id = self.px4_ned_frame_id
+                t_interp.child_frame_id = self.base_link_frame_id
+                t_interp.transform.translation.x = lerp(self.msg_queue[0].timestamp_sample, t0.transform.translation.x, self.msg_queue[1].timestamp_sample, t1.transform.translation.x, self.t_query_us)
+                t_interp.transform.translation.y = lerp(self.msg_queue[0].timestamp_sample, t0.transform.translation.y, self.msg_queue[1].timestamp_sample, t1.transform.translation.y, self.t_query_us)
+                t_interp.transform.translation.z = lerp(self.msg_queue[0].timestamp_sample, t0.transform.translation.z, self.msg_queue[1].timestamp_sample, t1.transform.translation.z, self.t_query_us)
+                t_interp.transform.rotation.x, t_interp.transform.rotation.y, t_interp.transform.rotation.z, t_interp.transform.rotation.w = slerp(
+                    self.msg_queue[0].timestamp_sample,
+                    (t0.transform.rotation.w, t0.transform.rotation.x, t0.transform.rotation.y, t0.transform.rotation.z),
+                    self.msg_queue[1].timestamp_sample,
+                    (t1.transform.rotation.w, t1.transform.rotation.x, t1.transform.rotation.y, t1.transform.rotation.z),
+                    self.t_query_us
+                )
+                self.tf_broadcaster.sendTransform(t_interp)
+                self.t_query_us += int(1e6 / self.publish_rate)
+
+    def _broadcast_ekf(self, msg: VehicleOdometry):
+        """
+        Broadcasts transform at a fixed rate with extended Kalman filter strategy.
+        """
         pass
 
     def on_exit(self):

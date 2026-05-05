@@ -70,7 +70,7 @@ class FrameTransformerNode(Node):
         ).value
         self.arena_frame_id = self.declare_parameter(
             "arena_frame_id",
-            "odom",
+            "map",
             ParameterDescriptor(description="Frame ID for the arena frame."),
         ).value
         self.px4_ned_frame_id = self.declare_parameter(
