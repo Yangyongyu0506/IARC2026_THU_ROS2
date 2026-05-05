@@ -74,6 +74,16 @@ def euler_to_quaternion(roll, pitch, yaw) -> np.ndarray:
     )
     return q
 
+def ros2_quaternion_to_euler(q) -> np.ndarray:
+    """
+    Converts a ROS2 quaternion (x, y, z, w) to Euler angles (roll, pitch, yaw).
+    """
+    x, y, z, w = q.x, q.y, q.z, q.w
+    roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
+    pitch = np.arcsin(2 * (w * y - z * x))
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))
+    return np.array([roll, pitch, yaw])
+
 
 def quaternion_to_euler(q) -> np.ndarray:
     """

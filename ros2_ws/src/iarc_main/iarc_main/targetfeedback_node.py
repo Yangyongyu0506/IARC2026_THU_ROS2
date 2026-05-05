@@ -1,5 +1,6 @@
-"""
-Placeholder
+"""TargetFeedbackNode: Receive AprilTag / object detections, transform to arena frame, and relay via UDP.
+
+Optionally also publishes an OccupancyGrid map of visited cells for visualisation.
 """
 
 import rclpy
@@ -17,7 +18,14 @@ import json
 import socket
 from collections import deque
 
+
 class TargetFeedbackNode(Node):
+    """
+    Subscribes to tag poses, transforms them into the arena frame via tf2, quantises to a
+    grid, and forwards the grid coordinates over UDP.  When ``do_map_pub`` is enabled, an
+    OccupancyGrid of visited cells is published on a separate timer.
+    """
+
     def __init__(self):
         super().__init__("target_feedback_node")
         self._param_init()
@@ -25,76 +33,63 @@ class TargetFeedbackNode(Node):
         self.get_logger().info("Target Feedback Node initialized")
 
     def _param_init(self):
+        """Declare all parameters (receiver topics, feedback UDP address, grid resolution, etc.)."""
         # main parameters
         self.tag_pose_topic = self.declare_parameter(
             "tag_pose_topic",
             "pose",
-            ParameterDescriptor(
-                description="Topic name for receiving tag poses"
-            )
+            ParameterDescriptor(description="Topic name for receiving tag poses"),
         ).value
         self.arena_frame_id = self.declare_parameter(
             "arena_frame_id",
             "map",
-            ParameterDescriptor(
-                description="Frame ID of the arena coordinate system"
-            )
+            ParameterDescriptor(description="Frame ID of the arena coordinate system"),
         ).value
         self.feedback_ip = self.declare_parameter(
             "feedback_ip",
             "127.0.0.1",
-            ParameterDescriptor(
-                description="IP address of the feedback receiver"
-            )
+            ParameterDescriptor(description="IP address of the feedback receiver"),
         ).value
         self.feedback_port = self.declare_parameter(
             "feedback_port",
             6006,
-            ParameterDescriptor(
-                description="Port number of the feedback receiver"
-            )
+            ParameterDescriptor(description="Port number of the feedback receiver"),
         ).value
         self.feedback_rate = self.declare_parameter(
             "feedback_rate",
             10.0,
-            ParameterDescriptor(
-                description="Rate (Hz) at which to send feedback"
-            )
+            ParameterDescriptor(description="Rate (Hz) at which to send feedback"),
         ).value
         self.grid_size_m = self.declare_parameter(
             "grid_size(meters)",
             0.5,
-            ParameterDescriptor(
-                description="Size of each grid cell in meters"
-            )
+            ParameterDescriptor(description="Size of each grid cell in meters"),
         ).value
         self.tf_lookup_timeout_s = self.declare_parameter(
             "tf_lookup_timeout(seconds)",
             0.1,
-            ParameterDescriptor(
-                description="Timeout (seconds) for TF lookups"
-            )
+            ParameterDescriptor(description="Timeout (seconds) for TF lookups"),
         ).value
         self.feedback_retry = self.declare_parameter(
             "feedback_retry",
             3,
             ParameterDescriptor(
                 description="Number of times to retry sending feedback if it fails"
-            )
+            ),
         ).value
         self.msg_queue_max_size = self.declare_parameter(
             "msg_queue_max_size",
             100,
             ParameterDescriptor(
                 description="Maximum size of the feedback message queue"
-            )
+            ),
         ).value
         self.do_map_pub = self.declare_parameter(
             "do_map_pub",
             False,
             ParameterDescriptor(
                 description="Whether to publish occupancy grid maps for visualization"
-            )
+            ),
         ).value
         if self.do_map_pub:
             self.get_logger().info("Occupancy grid map publishing enabled")
@@ -104,69 +99,77 @@ class TargetFeedbackNode(Node):
                 "map",
                 ParameterDescriptor(
                     description="Topic name for receiving occupancy grid maps"
-                )
+                ),
             ).value
             self.map_pub_rate = self.declare_parameter(
                 "map_pub_rate",
                 1.0,
                 ParameterDescriptor(
                     description="Rate (Hz) at which to publish occupancy grid maps"
-                )
+                ),
             ).value
 
     def _ros2_init(self):
         """
-        Placeholder
+        Set up tf listener, UDP socket, pose subscription, and feedback timer.
+
+        If ``do_map_pub`` is true, an additional map publisher and timer are created.
         """
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-    
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.msg_queue = deque(maxlen=self.msg_queue_max_size)
 
         self.pose_sub = self.create_subscription(
-            PoseStamped,
-            self.tag_pose_topic,
-            self._pose_callback,
-            10
+            PoseStamped, self.tag_pose_topic, self._pose_callback, 10
         )
         self.feedback_timer = self.create_timer(
-            1.0 / self.feedback_rate,
-            self._feedback_timer_callback
+            1.0 / self.feedback_rate, self._feedback_timer_callback
         )
 
         if self.do_map_pub:
             self.grid_set = set()
             self.map_pub = self.create_publisher(OccupancyGrid, self.map_topic, 10)
             self.map_pub_timer = self.create_timer(
-                1.0 / self.map_pub_rate,
-                self._map_pub_timer_callback
+                1.0 / self.map_pub_rate, self._map_pub_timer_callback
             )
 
     def _feedback_timer_callback(self):
         """
-        Placeholder
+        Drain the feedback queue, sending each item via UDP.
+
+        Each message is retried up to ``feedback_retry`` times; if all attempts fail
+        the message is dropped with an error log.
         """
         while self.msg_queue:
             msg = self.msg_queue[0]  # Peek at the front of the queue
             for _ in range(self.feedback_retry):
                 try:
                     self.sock.sendto(
-                        msg.encode("utf-8"),
-                        (self.feedback_ip, self.feedback_port)
+                        msg.encode("utf-8"), (self.feedback_ip, self.feedback_port)
                     )
                     self.msg_queue.popleft()  # Remove the message after successful send
                     break
                 except socket.error as e:
                     self.get_logger().error(f"Failed to send feedback: {e}")
             else:
-                self.get_logger().error(f"Failed to send feedback after {self.feedback_retry} attempts, dropping message")
+                self.get_logger().error(
+                    f"Failed to send feedback after {self.feedback_retry} attempts, dropping message"
+                )
                 self.msg_queue.popleft()  # Drop the message after exhausting retries
 
     def _pose_callback(self, msg: PoseStamped):
         """
-        Placeholder
+        Transform the incoming pose to the arena frame, quantise to grid, and enqueue for
+        UDP feedback.  Falls back to the latest available transform if a timestamped lookup
+        fails.
         """
+        # TODO: re-sending the same grid cell every feedback cycle wastes
+        #       bandwidth.  Cache the set of sent cells and only enqueue new ones.
+        # TODO: the grid coordinate calculation assumes that x >= 0 and y >= 0.
+        #       Detections left of or behind the origin will produce negative indices
+        #       and break the occupancy grid logic.
         source_frame = msg.header.frame_id
         query_time = rclpy.time.Time.from_msg(msg.header.stamp)
         try:
@@ -174,32 +177,45 @@ class TargetFeedbackNode(Node):
                 self.arena_frame_id,
                 source_frame,
                 query_time,
-                Duration(seconds=self.tf_lookup_timeout_s)
+                Duration(seconds=self.tf_lookup_timeout_s),
             )
         except TransformException as e:
             try:
-                self.get_logger().error(f"TF lookup failed: {e}, using latest available transform")
+                self.get_logger().error(
+                    f"TF lookup failed: {e}, using latest available transform"
+                )
                 transform = self.tf_buffer.lookup_transform(
                     self.arena_frame_id,
                     source_frame,
                     rclpy.time.Time(),
-                    Duration(seconds=self.tf_lookup_timeout_s)
-                ) # How to deal with situations when the transform chain isn't yet established?
+                    Duration(seconds=self.tf_lookup_timeout_s),
+                )  # Fallback: use the newest available transform
             except TransformException as e:
-                self.get_logger().error(f"Failed to get any transform: {e}, skipping this pose")
+                self.get_logger().error(
+                    f"Failed to get any transform: {e}, skipping this pose"
+                )
                 return
         transformed_pose = do_transform_pose(msg, transform)
-        x, y = int(transformed_pose.pose.position.x / self.grid_size_m), int(transformed_pose.pose.position.y / self.grid_size_m)
+        x, y = (
+            int(transformed_pose.pose.position.x / self.grid_size_m),
+            int(transformed_pose.pose.position.y / self.grid_size_m),
+        )
         if self.do_map_pub:
             self.grid_set.add((x, y))
-        feedback_payload = {
-            "x": x,
-            "y": y
-        }
+        feedback_payload = {"x": x, "y": y}
         feedback_json = json.dumps(feedback_payload)
         self.msg_queue.append(feedback_json)
 
     def _map_pub_timer_callback(self):
+        """Build and publish an OccupancyGrid of visited cells.
+
+        The grid origin is always (0, 0) and the size is determined by the maximum
+        observed grid index in each dimension, so the map can only grow in the
+        +x, +y direction.
+        """
+        # TODO: grid_set grows without bound.  Consider fixed-size map or periodic
+        #       trimming.  Scanning max(grid_set) on every callback is O(n) — cache
+        #       width/height and update incrementally.
         if not self.grid_set:
             return
         msg = OccupancyGrid()
@@ -223,8 +239,10 @@ class TargetFeedbackNode(Node):
         self.map_pub.publish(msg)
 
     def on_exit(self):
+        """Close the UDP socket on shutdown."""
         self.sock.close()
         self.get_logger().warn("Target Feedback Node shutting down")
+
 
 def main(args=None):
     rclpy.init(args=args)

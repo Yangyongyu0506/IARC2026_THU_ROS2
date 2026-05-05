@@ -103,8 +103,8 @@ ctest --test-dir build -R test-token-bucket --output-on-failure
 | `iarc_msgs` | `ament_cmake` | Custom interfaces (`GetStaticTransform.srv`) |
 | `px4_msgs` | `ament_cmake` | PX4 uORB message definitions |
 | `px4_ros_com` | `ament_cmake` | PX4-ROS2 bridge examples, `frame_transforms` library |
-| `iarc_utils` | `ament_python` | Message filters (`PX4MessageFilter`, `LazyPX4MessageFilter`, `PX4MessageClamper`), math utilities (`rotation_matrix_to_quaternion`, `force_orthogonal`, plane fitting) |
-| `iarc_main` | `ament_python` | `FrameTransformerNode` — computes & broadcasts arena↔PX4-NED static transform |
+| `iarc_utils` | `ament_python` | Message filters (`PX4MessageFilter`, `LazyPX4MessageFilter`, `PX4MessageClamper`), math utilities (`rotation_matrix_to_quaternion`, `lerp`, `slerp`, `stamp2us`, plane fitting) |
+| `iarc_main` | `ament_python` | Core mission nodes: `FrameTransformerNode`, `OdomTFBroadcasterNode`, `SetpointSenderNode`, `TargetFeedbackNode` |
 | `iarc_sim` | `ament_python` | `UDPServerNode` — receives UDP position commands and forwards to PX4 offboard control |
 | `test_pkg` | `ament_python` | Side-by-side test harness comparing ROS 2 `ApproximateTimeSynchronizer` with custom `PX4MessageFilter` |
 
@@ -129,7 +129,49 @@ ros2 run iarc_main frametransformer_node --ros-args \
   -p least_paired_msgs_num:=10
 ```
 
-### UDP Server (Simulation)
+### Odometry TF Broadcaster
+
+```bash
+ros2 run iarc_main odomtfbroadcaster_node --ros-args \
+  -p px4_odom_topic:=/fmu/out/vehicle_odometry \
+  -p strategy:=odom_callback \
+  -p px4_ned_frame_id:=px4_ned \
+  -p base_link_frame_id:=base_link
+```
+
+Interpolated mode (lerp position, slerp orientation between last two messages):
+
+```bash
+ros2 run iarc_main odomtfbroadcaster_node --ros-args \
+  -p strategy:=lerp \
+  -p publish_rate:=50.0
+```
+
+### Setpoint Sender
+
+```bash
+ros2 run iarc_main setpointsender_node --ros-args \
+  -p arena_frame_id:=arena \
+  -p px4_ned_frame_id:=px4_ned \
+  -p udp_port_recv:=5005 \
+  -p timer_period:=0.1
+```
+
+UDP JSON protocol: `{"s": <seq>, "c": "a"|"d"|"m", "x": ..., "y": ..., "z": ..., "yaw": ...}`
+- `a` — arm, `d` — disarm, `m` — move to position + heading
+
+### Target Feedback
+
+```bash
+ros2 run iarc_main targetfeedback_node --ros-args \
+  -p tag_pose_topic:=pose \
+  -p arena_frame_id:=arena \
+  -p feedback_ip:=192.168.1.100 \
+  -p feedback_port:=6006 \
+  -p do_map_pub:=true
+```
+
+### Sim UDP Server
 
 ```bash
 ros2 run iarc_sim udpserver_node --ros-args \

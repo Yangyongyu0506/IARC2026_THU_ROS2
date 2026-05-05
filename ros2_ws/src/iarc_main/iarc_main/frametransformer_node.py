@@ -128,6 +128,9 @@ class FrameTransformerNode(Node):
                     ),
                 ).value
                 self.paired_points = {"px4": [], "arena": []}
+                # TODO: paired_points is accessed only in the single-
+                #       threaded default executor, but would need locking
+                #       if a multi-threaded executor is ever used.
                 self.is_calibrated = False
 
     def _ros2_init(self):
